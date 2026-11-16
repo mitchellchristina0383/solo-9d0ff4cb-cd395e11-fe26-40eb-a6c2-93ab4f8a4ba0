@@ -4,8 +4,11 @@
 - 输入按“整版提交”存为不可变版本（versions + cells），替换即产生新版本。
 - 生成任务在创建（生成开始）的同一事务内固定 old/new 版本号，
   之后即使输入被替换，任务仍按该快照计算。
-- current_result 为单行表，只在新结果完整计算成功后于同一事务内切换，
-  失败或进行中绝不触碰它，旧发布结果保持可查。
+- current_result 为单行表，只在新结果完整计算成功后于同一事务内切换；
+  切换是单调的：仅当刚成功的任务编号高于当前已发布任务时才推进，
+  因此 /result 始终指向“已成功任务中编号最新的一项”。
+  多个服务实例共用同一 SQLite、任务交错完成时，后完成的旧任务
+  不会覆盖编号更新任务的发布；失败或进行中绝不触碰它，旧发布结果保持可查。
 """
 from __future__ import annotations
 
@@ -254,18 +257,23 @@ def _load_snapshot(conn: sqlite3.Connection, gen_id: int) -> dict[str, Any]:
 def run_generation(gen_id: int, db_path: Path | None = None) -> None:
     """工作线程入口：按任务固定的快照计算并原子发布；失败只标记任务。
 
+    发布指针单调前进：只有编号更高的成功任务才会切换 current_result，
+    后完成的旧任务保留自己的成功明细但不覆盖已发布结果。
     任何异常都会把任务落为 failed（而不是永久 running），
     且失败路径绝不写入 current_result，旧发布结果保持可查。
     """
     conn = get_conn(db_path)
     try:
         # 1. 抢占任务并读取快照（任务版本号在创建时已固定，不受新提交影响）
-        conn.execute(
+        cur = conn.execute(
             "UPDATE generations SET status='running', started_at=? "
             "WHERE id=? AND status='pending'",
             (_now(), gen_id),
         )
         conn.commit()
+        if cur.rowcount == 0:
+            # 任务不存在或已被其他工作者认领，直接放弃
+            return
         snap = _load_snapshot(conn, gen_id)
 
         # 2. 纯函数计算（覆盖校验 + 最大余数分摊）
@@ -286,8 +294,10 @@ def run_generation(gen_id: int, db_path: Path | None = None) -> None:
             )
             return
 
-        # 3. 原子发布：明细 + 任务成功 + 切换当前结果，同一事务
-        # 事务异常自动回滚，current_result 保持旧值
+        # 3. 原子发布：明细 + 任务成功 + 推进当前结果指针，同一事务。
+        # 指针只许单调前进：仅当本任务编号高于当前已发布任务时才切换，
+        # 因此多实例交错完成时，后完成的旧任务绝不会把 /result 退回旧版本；
+        # 事务异常自动回滚，current_result 保持旧值。
         with conn:
             for a in allocations:
                 conn.execute(
@@ -305,7 +315,8 @@ def run_generation(gen_id: int, db_path: Path | None = None) -> None:
                 "ON CONFLICT(only_row) DO UPDATE SET "
                 "generation_id=excluded.generation_id,"
                 " published_at=excluded.published_at,"
-                " total_households=excluded.total_households",
+                " total_households=excluded.total_households "
+                "WHERE excluded.generation_id > current_result.generation_id",
                 (gen_id, _now(), total),
             )
     except Exception as exc:  # 兜底：任何意外都落 failed，不卡死任务

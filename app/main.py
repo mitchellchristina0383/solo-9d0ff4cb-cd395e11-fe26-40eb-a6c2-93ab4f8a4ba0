@@ -166,7 +166,9 @@ def get_generation(
 def get_current_result(conn: Connection = Depends(get_db)):
     """当前已发布结果（片区汇总 + 两份输入版本）。
 
-    新结果完整发布前，这里始终返回上一份已发布结果；从未发布过时返回 404。
+    始终指向已成功任务中编号最新的一项：新结果完整发布前，这里始终返回
+    上一份已发布结果；后完成的旧任务不会覆盖编号更新任务的发布；
+    从未发布过时返回 404。
     """
     result = db.get_current_result(conn)
     if result is None:
